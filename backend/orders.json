@@ -1,0 +1,28 @@
+[
+  {
+    "drinkType": "cappuccino",
+    "size": "extra large",
+    "milk": "none",
+    "extras": [],
+    "name": "Pushes",
+    "timestamp": "2025-11-23T19:56:44.092226"
+  },
+  {
+    "drinkType": "cappuccino",
+    "size": "large",
+    "milk": "none",
+    "extras": [],
+    "name": "Buscist",
+    "timestamp": "2025-11-23T20:00:44.440970"
+  },
+  {
+    "drinkType": "coffee",
+    "size": "medium",
+    "milk": "none",
+    "extras": [
+      "vanilla"
+    ],
+    "name": "Buscist",
+    "timestamp": "2025-11-23T20:10:26.941811"
+  }
+]
