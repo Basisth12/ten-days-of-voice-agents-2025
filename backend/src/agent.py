@@ -1,15 +1,14 @@
 import logging
-import json
 import os
-import asyncio
-from datetime import datetime, timedelta
-from typing import Annotated, Literal, Optional, Dict, List
-from dataclasses import dataclass, field
+import sqlite3
+from datetime import datetime
+from typing import Annotated, Optional
+from dataclasses import dataclass
 
-print("\n" + "=" * 50)
-print("Razorpay SDR Agent")
-print("agent.py LOADED SUCCESSFULLY!")
-print("=" * 50 + "\n")
+print("\n" + "🛡" * 50)
+print("🚀 BANK FRAUD AGENT (SQLite) - INITIALIZED")
+print("📚 TASKS: Verify Identity -> Check Transaction -> Update DB")
+print("🛡" * 50 + "\n")
 
 from dotenv import load_dotenv
 from pydantic import Field
@@ -24,368 +23,284 @@ from livekit.agents import (
     function_tool,
     RunContext,
 )
-
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent")
+logging.basicConfig(level=logging.INFO)
 load_dotenv(".env.local")
 
-FAQ_FILE = "razorpay_faq.json"
-LEADS_FILE = "leads.json"
-MEETINGS_FILE = "meetings.json"
-CALL_NOTES_FILE = "call_notes.json"
-EMAILS_FILE = "follow_up_emails.json"
 
-def load_faq() -> Dict:
-    """Load Razorpay FAQ data"""
-    try:
-        path = os.path.join(os.path.dirname(__file__), FAQ_FILE)
-        with open(path, "r", encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"Error loading FAQ: {e}")
-        return {"company": {}, "faq": []}
+DB_FILE = "fraud_db.sqlite"
 
-def save_lead(lead_data: Dict):
-    """Save lead data to JSON file"""
-    try:
-        path = os.path.join(os.path.dirname(__file__), LEADS_FILE)
-        leads = []
-        
-        if os.path.exists(path):
-            with open(path, "r", encoding='utf-8') as f:
-                leads = json.load(f)
-        
-        leads.append(lead_data)
-        
-        with open(path, "w", encoding='utf-8') as f:
-            json.dump(leads, f, indent=2)
-        
-        print(f"Lead saved: {lead_data.get('name', 'Unknown')}")
-    except Exception as e:
-        print(f"Error saving lead: {e}")
-
-FAQ_DATA = load_faq()
 
 @dataclass
-class LeadInfo:
-    name: str = ""
-    company: str = ""
-    email: str = ""
-    role: str = ""
-    use_case: str = ""
-    team_size: str = ""
-    timeline: str = ""
-    
-    def is_complete(self) -> bool:
-        return all([self.name, self.company, self.email, self.role])
+class FraudCase:
+    userName: str
+    securityIdentifier: str
+    cardEnding: str
+    transactionName: str
+    transactionAmount: str
+    transactionTime: str
+    transactionSource: str
+    case_status: str = "pending_review"
+    notes: str = ""
 
-@dataclass
-class SDRState:
-    lead: LeadInfo = field(default_factory=LeadInfo)
-    conversation_stage: Literal["greeting", "discovery", "faq", "qualification", "closing"] = "greeting"
-    call_ended: bool = False
-    persona: str = "unknown"
-    conversation_transcript: List[str] = field(default_factory=list)
-    pain_points: List[str] = field(default_factory=list)
+
+def get_db_path():
+    """
+    Return full path for DB. If __file__ is not present (REPL), fall back to current working dir.
+    """
+    base_dir = os.path.dirname(__file__) if "__file__" in globals() else os.getcwd()
+    return os.path.join(base_dir, DB_FILE)
+
+
+def get_conn():
+    path = get_db_path()
+    # Ensure directory exists (rarely necessary for script-run, but safe)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def seed_database():
+    """Create SQLite DB and insert sample rows if empty."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fraud_cases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            userName TEXT NOT NULL,
+            securityIdentifier TEXT,
+            cardEnding TEXT,
+            transactionName TEXT,
+            transactionAmount TEXT,
+            transactionTime TEXT,
+            transactionSource TEXT,
+            case_status TEXT DEFAULT 'pending_review',
+            notes TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+        """
+    )
+
+    cur.execute("SELECT COUNT(1) FROM fraud_cases")
+    count = cur.fetchone()[0]
+    if count == 0:
+        sample_data = [
+            (
+                "John", "12345", "4242",
+                "ABC Industry", "$450.00", "2:30 AM EST", "alibaba.com",
+                "pending_review", "Automated flag: High value transaction."
+            ),
+            (
+                "Sarah", "99887", "1199",
+                "Unknown Crypto Exchange", "$2,100.00", "4:15 AM PST", "online_transfer",
+                "pending_review", "Automated flag: Unusual location."
+            )
+        ]
+        cur.executemany(
+            """
+            INSERT INTO fraud_cases (
+                userName, securityIdentifier, cardEnding, transactionName,
+                transactionAmount, transactionTime, transactionSource, case_status, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            sample_data,
+        )
+        conn.commit()
+        print(f"✅ SQLite DB seeded at {get_db_path()}")
+
+    conn.close()
+
+
+# Initialize DB on load
+try:
+    seed_database()
+except Exception as e:
+    logger.exception("Failed to seed database: %s", e)
+
 
 @dataclass
 class Userdata:
-    sdr_state: SDRState
-    agent_session: Optional[AgentSession] = None
+    active_case: Optional[FraudCase] = None
+
 
 @function_tool
-async def search_faq(
+async def lookup_customer(
     ctx: RunContext[Userdata],
-    query: Annotated[str, Field(description="User's question about Razorpay")]
+    name: Annotated[str, Field(description="The name the user provides")],
 ) -> str:
-    """Search FAQ for relevant answers about Razorpay"""
-    query_lower = query.lower()
-    
-    for faq_item in FAQ_DATA["faq"]:
-        question = faq_item["question"].lower()
-        answer = faq_item["answer"]
-        
-        # Simple keyword matching
-        if any(word in question for word in query_lower.split()) or any(word in query_lower for word in question.split()):
-            return f"Based on our FAQ: {answer}"
-    
-    # If no direct match, return general company info
-    company = FAQ_DATA["company"]
-    return f"I'd be happy to help! {company['description']}. Could you be more specific about what you'd like to know about Razorpay?"
-
-@function_tool
-async def collect_lead_info(
-    ctx: RunContext[Userdata],
-    field: Annotated[str, Field(description="The field to update: name, company, email, role, use_case, team_size, or timeline")],
-    value: Annotated[str, Field(description="The value provided by the user")]
-) -> str:
-    """Collect and store lead information"""
-    state = ctx.userdata.sdr_state
-    
-    if hasattr(state.lead, field):
-        setattr(state.lead, field, value)
-        print(f"Updated {field}: {value}")
-        
-        # Check what's still needed
-        missing = []
-        if not state.lead.name: missing.append("name")
-        if not state.lead.company: missing.append("company")
-        if not state.lead.email: missing.append("email")
-        if not state.lead.role: missing.append("role")
-        
-        if missing:
-            return f"Got it! I still need your {', '.join(missing)}."
-        else:
-            return "Perfect! I have all the key information. Is there anything else about Razorpay you'd like to know?"
-    
-    return "I couldn't update that information. Please try again."
-
-@function_tool
-async def book_meeting(
-    ctx: RunContext[Userdata],
-    preferred_time: Annotated[str, Field(description="User's preferred meeting time (e.g., 'tomorrow 2pm', 'next week')")] = ""
-) -> str:
-    """Book a demo meeting with available time slots"""
-    # Mock available slots
-    now = datetime.now()
-    slots = [
-        (now + timedelta(days=1)).strftime("%Y-%m-%d 2:00 PM"),
-        (now + timedelta(days=2)).strftime("%Y-%m-%d 10:00 AM"),
-        (now + timedelta(days=3)).strftime("%Y-%m-%d 3:00 PM")
-    ]
-    
-    if not preferred_time:
-        return f"I'd love to schedule a demo! Here are some available slots: {', '.join(slots)}. Which works best for you?"
-    
-    # Book the meeting
-    lead = ctx.userdata.sdr_state.lead
-    meeting_data = {
-        "name": lead.name,
-        "email": lead.email,
-        "company": lead.company,
-        "requested_time": preferred_time,
-        "booked_slot": slots[0],  # Default to first slot
-        "timestamp": datetime.now().isoformat()
-    }
-    
+    """Lookup a customer in SQLite DB."""
+    logger.info("🔎 LOOKING UP: %s", name)
     try:
-        path = os.path.join(os.path.dirname(__file__), MEETINGS_FILE)
-        meetings = []
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                meetings = json.load(f)
-        meetings.append(meeting_data)
-        with open(path, "w") as f:
-            json.dump(meetings, f, indent=2)
-    except Exception as e:
-        print(f"Error saving meeting: {e}")
-    
-    return f"Perfect! I've booked your demo for {meeting_data['booked_slot']}. You'll receive a calendar invite at {lead.email}."
+        conn = get_conn()
+        cur = conn.cursor()
 
-@function_tool
-async def detect_persona(
-    ctx: RunContext[Userdata],
-    user_message: Annotated[str, Field(description="User's recent message to analyze for persona")]
-) -> str:
-    """Detect user persona and adapt pitch"""
-    state = ctx.userdata.sdr_state
-    msg_lower = user_message.lower()
-    
-    # Simple persona detection
-    if any(word in msg_lower for word in ["code", "api", "integrate", "developer", "technical"]):
-        state.persona = "developer"
-        return "I can see you're technically focused! Let me highlight Razorpay's developer-friendly features: easy API integration, comprehensive SDKs, and detailed documentation."
-    elif any(word in msg_lower for word in ["product", "feature", "roadmap", "user"]):
-        state.persona = "product_manager"
-        return "As a product person, you'll appreciate our feature-rich platform, analytics dashboard, and how we help improve conversion rates."
-    elif any(word in msg_lower for word in ["founder", "startup", "business", "growth"]):
-        state.persona = "founder"
-        return "Perfect! As a founder, you need reliable payments that scale. Razorpay handles everything from small transactions to enterprise volumes."
-    else:
-        state.persona = "business_user"
-        return "I'll focus on how Razorpay can streamline your payment processes and improve your business operations."
+        cur.execute(
+            "SELECT * FROM fraud_cases WHERE LOWER(userName) = LOWER(?) LIMIT 1",
+            (name,),
+        )
+        row = cur.fetchone()
+        conn.close()
 
-@function_tool
-async def track_pain_point(
-    ctx: RunContext[Userdata],
-    pain_point: Annotated[str, Field(description="A business challenge or pain point mentioned by the user")]
-) -> str:
-    """Track user's pain points for better qualification"""
-    state = ctx.userdata.sdr_state
-    state.pain_points.append(pain_point)
-    return f"I understand that {pain_point} is a challenge for you. Let me explain how Razorpay addresses this specific issue."
+        if not row:
+            return "User not found in the fraud database. Please repeat the name."
 
-@function_tool
-async def check_returning_visitor(
-    ctx: RunContext[Userdata],
-    email: Annotated[str, Field(description="User's email to check against previous leads")]
-) -> str:
-    """Check if user is a returning visitor"""
-    try:
-        path = os.path.join(os.path.dirname(__file__), LEADS_FILE)
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                leads = json.load(f)
-            
-            for lead in leads:
-                if lead.get("email", "").lower() == email.lower():
-                    return f"Welcome back! I see you were interested in {lead.get('use_case', 'our payment solutions')} last time. How can I help you today?"
-    except Exception as e:
-        print(f"Error checking returning visitor: {e}")
-    
-    return "Great to meet you! I don't see any previous conversations, so let's start fresh."
-
-@function_tool
-async def end_call_summary(
-    ctx: RunContext[Userdata]
-) -> str:
-    """Generate end-of-call summary and save lead"""
-    state = ctx.userdata.sdr_state
-    lead = state.lead
-    
-    # Save to JSON
-    lead_data = {
-        "name": lead.name,
-        "company": lead.company,
-        "email": lead.email,
-        "role": lead.role,
-        "use_case": lead.use_case,
-        "team_size": lead.team_size,
-        "timeline": lead.timeline,
-        "timestamp": asyncio.get_event_loop().time()
-    }
-    
-    save_lead(lead_data)
-    state.call_ended = True
-    
-    summary = f"Thank you {lead.name}! Here's a quick summary: You're {lead.role} at {lead.company}, interested in {lead.use_case or 'our payment solutions'}. "
-    
-    if lead.timeline:
-        summary += f"Timeline: {lead.timeline}. "
-    
-    summary += "I'll make sure our team follows up with you soon. Have a great day!"
-    
-    # Generate call notes and qualification score
-    call_notes = {
-        "lead_info": lead_data,
-        "persona": state.persona,
-        "pain_points": state.pain_points,
-        "decision_maker": "yes" if "founder" in lead.role.lower() or "ceo" in lead.role.lower() else "unknown",
-        "budget_mentioned": "no",  # Could be enhanced with transcript analysis
-        "urgency": "medium" if lead.timeline else "low",
-        "fit_score": 75 if lead.is_complete() else 45,
-        "notes": f"Interested in {lead.use_case}. {state.persona} persona detected.",
-        "timestamp": datetime.now().isoformat()
-    }
-    
-    # Save call notes
-    try:
-        path = os.path.join(os.path.dirname(__file__), CALL_NOTES_FILE)
-        notes = []
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                notes = json.load(f)
-        notes.append(call_notes)
-        with open(path, "w") as f:
-            json.dump(notes, f, indent=2)
-    except Exception as e:
-        print(f"Error saving call notes: {e}")
-    
-    # Generate follow-up email
-    email_draft = {
-        "to": lead.email,
-        "subject": f"Great connecting with you, {lead.name}!",
-        "body": f"Hi {lead.name},\n\nThanks for taking the time to learn about Razorpay today! Based on our conversation, I understand you're looking for {lead.use_case or 'payment solutions'} for {lead.company}.\n\nAs discussed, Razorpay can help streamline your payment processes with our easy integration and competitive pricing. I'd love to show you a quick demo of how other companies like yours are using our platform.\n\nWould you be available for a 15-minute call this week?\n\nBest regards,\nRazorpay Sales Team",
-        "timestamp": datetime.now().isoformat()
-    }
-    
-    # Save email draft
-    try:
-        path = os.path.join(os.path.dirname(__file__), EMAILS_FILE)
-        emails = []
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                emails = json.load(f)
-        emails.append(email_draft)
-        with open(path, "w") as f:
-            json.dump(emails, f, indent=2)
-    except Exception as e:
-        print(f"Error saving email draft: {e}")
-    
-    return summary
-
-class RazorpaySDRAgent(Agent):
-    def __init__(self):
-        super().__init__(
-            instructions=f"""
-            You are a friendly Sales Development Representative (SDR) for Razorpay, India's leading payment gateway company.
-            
-            🎯 **YOUR ROLE:**
-            - Greet visitors warmly and ask what brought them here
-            - Understand their business needs and use case
-            - Answer questions about Razorpay using the FAQ tool
-            - Collect key lead information naturally during conversation
-            - Provide helpful, accurate information about our payment solutions
-            
-            📋 **LEAD QUALIFICATION:**
-            Always try to collect: name, company, email, role, use case, team size, timeline
-            
-            🏢 **ABOUT RAZORPAY:**
-            {FAQ_DATA["company"]["description"]}
-            
-            💬 **CONVERSATION STYLE:**
-            - Be conversational and helpful, not pushy
-            - Ask open-ended questions about their business
-            - Use search_faq for product/pricing questions
-            - Use detect_persona to adapt your pitch based on their role
-            - Use collect_lead_info to store responses
-            - Use check_returning_visitor if they provide email
-            - Offer to book_meeting for interested prospects
-            - Use end_call_summary when they're ready to end
-            
-            Start by greeting them and asking what brought them to learn about Razorpay today.
-            """,
-            tools=[search_faq, collect_lead_info, book_meeting, detect_persona, track_pain_point, check_returning_visitor, end_call_summary],
+        record = dict(row)
+        ctx.userdata.active_case = FraudCase(
+            userName=record["userName"],
+            securityIdentifier=record["securityIdentifier"],
+            cardEnding=record["cardEnding"],
+            transactionName=record["transactionName"],
+            transactionAmount=record["transactionAmount"],
+            transactionTime=record["transactionTime"],
+            transactionSource=record["transactionSource"],
+            case_status=record.get("case_status", "pending_review"),
+            notes=record.get("notes", ""),
         )
 
+        return (
+            f"Record Found.\n"
+            f"User: {record['userName']}\n"
+            f"Security ID (Expected): {record['securityIdentifier']}\n"
+            f"Transaction: {record['transactionAmount']} at {record['transactionName']} ({record['transactionSource']})\n"
+            f"Ask user for their Security Identifier now."
+        )
+
+    except Exception as e:
+        logger.exception("Database error in lookup_customer: %s", e)
+        return f"Database error: {str(e)}"
+
+
+@function_tool
+async def resolve_fraud_case(
+    ctx: RunContext[Userdata],
+    status: Annotated[str, Field(description="confirmed_safe or confirmed_fraud")],
+    notes: Annotated[str, Field(description="Notes on the user's confirmation")],
+) -> str:
+
+    if not ctx.userdata.active_case:
+        return "Error: No active case selected."
+
+    case = ctx.userdata.active_case
+    case.case_status = status
+    case.notes = notes
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            UPDATE fraud_cases
+            SET case_status = ?, notes = ?, updated_at = datetime('now')
+            WHERE userName = ?
+            """,
+            (case.case_status, case.notes, case.userName),
+        )
+        conn.commit()
+
+        # Confirm updated row
+        cur.execute("SELECT * FROM fraud_cases WHERE userName = ? LIMIT 1", (case.userName,))
+        row = cur.fetchone()
+        conn.close()
+
+        if not row:
+            return "Error: Could not find the updated record."
+
+        updated_row = dict(row)
+
+        logger.info("✅ CASE UPDATED: %s -> %s", case.userName, status)
+
+        if status == "confirmed_fraud":
+            # (In reality you'd also call blocking API / trigger workflows)
+            return (
+                f"Fraud confirmed. Card ending {case.cardEnding} is now BLOCKED. "
+                f"A replacement card will be issued.\n"
+                f"DB Updated At: {updated_row.get('updated_at')}"
+            )
+        else:
+            return (
+                f"Transaction marked SAFE. Restrictions lifted.\n"
+                f"DB Updated At: {updated_row.get('updated_at')}"
+            )
+
+    except Exception as e:
+        logger.exception("Error saving to DB in resolve_fraud_case: %s", e)
+        return f"Error saving to DB: {e}"
+
+
+class FraudAgent(Agent):
+    def __init__(self):
+        # call base Agent initializer correctly
+        super().__init__(
+            instructions="""
+            You are 'Alex', a Fraud Detection Specialist at Dishant Bank.
+            Follow strict security protocol:
+
+            1. Greeting + ask for first name.
+            2. Immediately call lookup_customer(name).
+            3. Ask for Security Identifier.
+            4. If correct → continue. If incorrect → end call politely.
+            5. Explain suspicious transaction.
+            6. Ask: Did you make this transaction?
+               - YES → resolve_fraud_case('confirmed_safe')
+               - NO → resolve_fraud_case('confirmed_fraud')
+            7. Close professionally.
+            """,
+            tools=[lookup_customer, resolve_fraud_case],
+        )
+
+
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    # Keep safe-guard: use try/except when loading models
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+    except Exception:
+        logger.exception("Failed to prewarm VAD; continuing without it.")
+        proc.userdata["vad"] = None
+
 
 async def entrypoint(ctx: JobContext):
-    ctx.log_context_fields = {"room": ctx.room.name}
+    # Add safe logging of room name if available
+    try:
+        ctx.log_context_fields = {"room": getattr(ctx.room, "name", "unknown")}
+    except Exception:
+        ctx.log_context_fields = {}
 
-    print("\n" + "=" * 25)
-    print("STARTING RAZORPAY SDR SESSION")
-    print(f"Loaded {len(FAQ_DATA['faq'])} FAQ entries")
-    
-    userdata = Userdata(sdr_state=SDRState())
+    print("\n" + "💼" * 25)
+    print("🚀 STARTING FRAUD ALERT SESSION (SQLite)")
+
+    userdata = Userdata()
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
         tts=murf.TTS(
-            voice="en-US-matthew", 
-            style="Conversational",        
+            voice="en-US-marcus",
+            style="Conversational",
             text_pacing=True,
         ),
         turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
+        vad=ctx.proc.userdata.get("vad"),
         userdata=userdata,
     )
-    
-    userdata.agent_session = session
-    
+
+    # Start the session with the configured agent
     await session.start(
-        agent=RazorpaySDRAgent(),
+        agent=FraudAgent(),
         room=ctx.room,
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC()
-        ),
+        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
     )
 
     await ctx.connect()
 
+
 if __name__ == "__main__":
+    # entrypoint and prewarm will be used by worker; run app
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
